@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-🌙 隔夜单股票池 — 交易日9:27 写入通达信 extern_user.txt + 101序列
+🌙 隔夜单股票池 — 交易日9:27 写入通达信 extern_user.txt + 101序列 + 129外部数据
+
+v2.1 (2026-09-05): 新增 ID=129「竞价当天最大占比」外部单值数据
+  与101同源同值（6时点最大值），但以 extern_user.txt 单值行写入（同115/125一类），
+  datacfg.dat 注册 type=0 外部（字符串/数值），重启通达信后在外部数据管理可见。
 
 v2.0 (2026-09-05): 新增 ID=101「竞价最大占比」(日期-数值序列)
   对每只股票取 隔夜单(9:15)/918/920/923/924/开盘(9:25) 六时点占比的最大值，
@@ -19,6 +23,7 @@ v2.0 (2026-09-05): 新增 ID=101「竞价最大占比」(日期-数值序列)
   ID=128 → 924占比 (09:24 买二占比)
   ID=116 → 当天开盘占比 (09:25 买一占比)
   ID=101 → 竞价最大占比 (上述6时点中的最大值, 日期-数值序列)
+  ID=129 → 竞价当天最大占比 (同上最大值, 外部单值行)
 
 兼容VBA格式：
   - 代码首位 6/8→1 (沪/科创板)，0/3→0 (深)，9→2 (北交所)
@@ -53,6 +58,10 @@ SIGNALS_101_ID = 101
 SIGNALS_101_NAME = "竞价最大占比"
 # 取最大值的6个来源时点: 隔夜单(核心)/918/920/923/924/开盘
 SRC_IDS_101 = (115, 125, 126, 127, 128, 116)
+
+# ── ID=129 竞价当天最大占比（外部单值数据, extern_user.txt） ──
+EXT_ID_129 = 129
+EXT_NAME_129 = "竞价当天最大占比"
 
 WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(WORKSPACE)
@@ -145,6 +154,7 @@ def build_lines(data: dict) -> tuple:
     lines = []
     ALL_IDS = (115, 125, 126, 127, 128, 116)
     count_by_id = {id_val: 0 for id_val in ALL_IDS}
+    count_by_id[EXT_ID_129] = 0
     nan_set = set()
     zero_set = set()
 
@@ -188,6 +198,20 @@ def build_lines(data: dict) -> tuple:
             log.warning("    ... 共 %d 条", len(zero_set))
 
     return lines, count_by_id
+
+
+def build_lines_129(data: dict) -> list:
+    """生成 ID=129 竞价当天最大占比行：flag|code|129||最大值（与101同源）"""
+    lines = []
+    for code, info in data.items():
+        flag = get_flag(code)
+        if not flag:
+            continue
+        mx = max_bid_ratio(info)
+        if mx is None:
+            continue
+        lines.append(f"{flag}|{code}|{EXT_ID_129}||{mx:.6f}")
+    return lines
 
 
 # ══════════════════ ID=101 竞价最大占比（signals_user_101 序列） ══════════════════
@@ -297,8 +321,10 @@ def ensure_datacfg_101_name():
     log.info("datacfg.dat: ID=%d 名称已注册为「%s」", SIGNALS_101_ID, SIGNALS_101_NAME)
 
 
-def write_to_file(lines: list) -> bool:
-    """追加到 extern_user.txt，替换旧行"""
+def write_to_file(lines: list, extra_lines: list = None) -> bool:
+    """追加到 extern_user.txt，替换旧行（extra_lines 为 ID=129 行，一并写入）"""
+    if extra_lines is None:
+        extra_lines = []
     if not os.path.exists(EXTERN_FILE):
         log.error("文件不存在: %s", EXTERN_FILE)
         return False
@@ -310,7 +336,7 @@ def write_to_file(lines: list) -> bool:
     except UnicodeDecodeError:
         text = raw.decode('gbk', errors='replace')
 
-    target_ids = {115, 125, 126, 127, 128, 116}
+    target_ids = {115, 125, 126, 127, 128, 116, EXT_ID_129}
     original = text.split('\n')
     kept = [l for l in original
             if not (len(l.split('|')) >= 3
@@ -318,12 +344,59 @@ def write_to_file(lines: list) -> bool:
                     and int(l.split('|')[2]) in target_ids)]
 
     kept.extend(lines)
+    kept.extend(extra_lines)
     new_text = '\n'.join(kept)
 
     with open(EXTERN_FILE, 'wb') as f:
         f.write(new_text.encode('gbk', errors='replace'))
 
     return True
+
+
+def ensure_datacfg_129():
+    """确保 datacfg.dat 中 ID=129「竞价当天最大占比」已注册（type=0 外部单值, ref=130）
+
+    若 129 记录已存在则不动（避免覆盖通达信运行中写入的内容），仅当缺失时插入到 127 之后。
+    """
+    if not os.path.exists(DATACFG_FILE):
+        log.warning("datacfg.dat 不存在，跳过129注册")
+        return
+    with open(DATACFG_FILE, 'rb') as f:
+        d = bytearray(f.read())
+    name_gbk = EXT_NAME_129.encode('gbk')
+    # 检查是否已注册
+    for i in range(len(d) // 120):
+        off = i * 120
+        if struct.unpack('<I', d[off:off + 4])[0] == EXT_ID_129:
+            cur = d[off + 8:off + 60].split(b'\x00')[0]
+            try:
+                cur_s = cur.decode('gbk')
+            except Exception:
+                cur_s = repr(cur)
+            if cur_s == EXT_NAME_129:
+                log.info("datacfg.dat: ID=%d「%s」已注册，跳过", EXT_ID_129, EXT_NAME_129)
+            else:
+                log.warning("datacfg.dat: ID=%d 已存在但名称=%r，未覆盖", EXT_ID_129, cur_s)
+            return
+    # 未注册 → 插入到 ID=127 记录之后
+    insert_off = None
+    for i in range(len(d) // 120):
+        off = i * 120
+        if struct.unpack('<I', d[off:off + 4])[0] == 127:
+            insert_off = (i + 1) * 120
+            break
+    if insert_off is None:
+        log.error("datacfg.dat 中未找到 ID=127，无法定位129插入点")
+        return
+    rec = bytearray(120)
+    struct.pack_into('<I', rec, 0, EXT_ID_129)
+    struct.pack_into('<I', rec, 4, 0)  # type=0 外部单值
+    rec[8:8 + len(name_gbk)] = name_gbk
+    struct.pack_into('<I', rec, 60, EXT_ID_129 + 1)  # ref=130
+    new_d = bytearray(d[:insert_off]) + rec + bytearray(d[insert_off:])
+    with open(DATACFG_FILE, 'wb') as f:
+        f.write(new_d)
+    log.info("datacfg.dat: 已插入 ID=%d「%s」注册记录", EXT_ID_129, EXT_NAME_129)
 
 
 def main():
@@ -346,14 +419,21 @@ def main():
         log.warning("没有有效隔夜单数据可写入（全部为NaN/0？）")
         return 1
 
-    ok = write_to_file(lines)
+    # ID=129 竞价当天最大占比行（与101同源同值）
+    lines_129 = build_lines_129(data)
+
+    ok = write_to_file(lines, lines_129)
     if not ok:
         return 1
 
     log.info("=" * 50)
-    log.info("写入 extern_user.txt 共 %d 条", total)
-    id_names = {115: '当天隔夜单(09:15买二)', 125: '918占比(09:18买二)', 126: '920占比(09:20买二)', 127: '923占比(09:23买二)', 128: '924占比(09:24买二)', 116: '当天开盘占比(09:25买一)'}
-    for id_val in (115, 125, 126, 127, 128, 116):
+    log.info("写入 extern_user.txt 共 %d 条 (含129: %d 条)", total, len(lines_129))
+    id_names = {115: '当天隔夜单(09:15买二)', 125: '918占比(09:18买二)', 126: '920占比(09:20买二)', 127: '923占比(09:23买二)', 128: '924占比(09:24买二)', 116: '当天开盘占比(09:25买一)', EXT_ID_129: '竞价当天最大占比'}
+    for id_val in (115, 125, 126, 127, 128, 116, EXT_ID_129):
+        if id_val == EXT_ID_129:
+            log.info("   ID=%d (%s): 取6时点最大值, 写入 %d 条",
+                     id_val, id_names[id_val], len(lines_129))
+            continue
         src = query_counts.get(id_val, 0)
         written = count_by_id.get(id_val, 0)
         log.info("   ID=%d (%s): 查到 %d 只, 写入 %d 条",
@@ -366,6 +446,7 @@ def main():
              SIGNALS_101_ID, SIGNALS_101_NAME, date_int)
     w101, r101, s101 = write_signals_101(data, date_int)
     ensure_datacfg_101_name()
+    ensure_datacfg_129()
     log.info("ID=101 竞价最大占比: 写入%d只(替换同日%d只, 跳过无有效值%d只)", w101, r101, s101)
     log.info("⚠️ 重启通达信后可在 自定义数据101 查看（重启前勿覆盖本文件）")
 
