@@ -1,25 +1,34 @@
 #!/usr/bin/env python3
 """
-🌙 隔夜单股票池 — 交易日9:27 写入通达信 extern_user.txt
+🌙 隔夜单股票池 — 交易日9:27 写入通达信 extern_user.txt + 101序列
+
+v2.0 (2026-09-05): 新增 ID=101「竞价最大占比」(日期-数值序列)
+  对每只股票取 隔夜单(9:15)/918/920/923/924/开盘(9:25) 六时点占比的最大值，
+  写入 signals_user_101/{市场标志}_{代码}.dat（每条8字节: 日期uint32小端 + 数值float32小端）
+  日期 = 数据所在交易日(运行日, 可传参覆盖)，同日重复记录自动替换，按日期升序排列
 
 建股票池：9:15/9:18/9:20/9:23/9:25 任一时间点 > 0.1
   - 9:15~9:23: 买二*100/自由流通股
   - 9:25: 买一*100/自由流通股(开盘价形成时刻)
 
 写入ID:
-  ID=115 → 当天隔夜单 (09:15 买二占比)
+  ID=115 → 当天隔夜单 (09:15 买二占比)  ← 核心
   ID=125 → 918占比 (09:18 买二占比)
   ID=126 → 920占比 (09:20 买二占比)
   ID=127 → 923占比 (09:23 买二占比)
   ID=128 → 924占比 (09:24 买二占比)
   ID=116 → 当天开盘占比 (09:25 买一占比)
+  ID=101 → 竞价最大占比 (上述6时点中的最大值, 日期-数值序列)
 
 兼容VBA格式：
   - 代码首位 6/8→1 (沪/科创板)，0/3→0 (深)，9→2 (北交所)
   - 每行: flag|code|ID||value
+
+用法: python3 gye.py [YYYYMMDD]   # 可传日期参数(写入101用)，默认当天
 """
 
-import sys, os, time, logging
+import sys, os, time, logging, struct
+from datetime import datetime
 
 # thsdk 正式账号配置（ths_config.py 软链指向 ~/.openclaw/workspace/ths_config.json，账号 zsyyddx）
 _STRATEGY_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -36,6 +45,15 @@ log = logging.getLogger("gye")
 
 # ── 路径 ──
 EXTERN_FILE = "/mnt/d/GP/通达信金融终端(开心果交易版)V2026/T0002/signals/extern_user.txt"
+SIGNALS_101_DIR = "/mnt/d/GP/通达信金融终端(开心果交易版)V2026/T0002/signals/signals_user_101"
+DATACFG_FILE = "/mnt/d/GP/通达信金融终端(开心果交易版)V2026/T0002/signals/datacfg.dat"
+
+# ── ID=101 竞价最大占比（signals_user_101 日期-数值序列） ──
+SIGNALS_101_ID = 101
+SIGNALS_101_NAME = "竞价最大占比"
+# 取最大值的6个来源时点: 隔夜单(核心)/918/920/923/924/开盘
+SRC_IDS_101 = (115, 125, 126, 127, 128, 116)
+
 WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(WORKSPACE)
 
@@ -172,6 +190,113 @@ def build_lines(data: dict) -> tuple:
     return lines, count_by_id
 
 
+# ══════════════════ ID=101 竞价最大占比（signals_user_101 序列） ══════════════════
+
+def max_bid_ratio(info: dict):
+    """取6时点占比最大值: 隔夜单(核心)/918/920/923/924/开盘；忽略NaN；全空返回None"""
+    vals = []
+    for idv in SRC_IDS_101:
+        v = info.get(idv)
+        if isinstance(v, (int, float)) and v == v:  # 排除NaN
+            vals.append(float(v))
+    return max(vals) if vals else None
+
+
+def resolve_date(argv: list) -> int:
+    """101写入用日期: 支持 python3 gye.py YYYYMMDD，默认当天"""
+    if len(argv) > 1 and argv[1].isdigit() and len(argv[1]) == 8:
+        return int(argv[1])
+    return int(datetime.now().strftime('%Y%m%d'))
+
+
+def write_signals_101(data: dict, date_int: int, dry_run: bool = False):
+    """写入 signals_user_101/{flag}_{code}.dat：每条8字节 = 日期(uint32小端,yyyymmdd) + 数值(float32小端)
+
+    - 文件不存在 → 新建；已存在 → 保留历史记录
+    - 同日记录 → 替换；其余按日期升序重排
+    返回 (写入只数, 替换只数, 跳过只数)
+    """
+    if dry_run:
+        log.info("[DRY-RUN] signals_user_101 预览 (date=%d, dir=%s)", date_int, SIGNALS_101_DIR)
+    written = replaced = skipped = 0
+    try:
+        os.makedirs(SIGNALS_101_DIR, exist_ok=True)
+    except Exception as e:
+        log.error("无法访问目录 %s: %s", SIGNALS_101_DIR, e)
+        return 0, 0, 0
+
+    for code, info in data.items():
+        flag = get_flag(code)
+        if not flag:
+            continue
+        mx = max_bid_ratio(info)
+        if mx is None:
+            skipped += 1
+            continue
+        fname = f"{flag}_{code}.dat"
+        fpath = os.path.join(SIGNALS_101_DIR, fname)
+        name = info.get('name', '')
+        if dry_run:
+            log.info("    %s %-6s → %s : %.4f", code, name, fname, mx)
+            written += 1
+            continue
+        # 读旧记录
+        recs = []
+        if os.path.exists(fpath) and os.path.getsize(fpath) > 0:
+            try:
+                raw = open(fpath, 'rb').read()
+                n = len(raw) // 8
+                if len(raw) % 8:
+                    log.warning("    %s 长度非8倍数(%dB)，尾部%d字节截断", fpath, len(raw), len(raw) % 8)
+                for i in range(n):
+                    d8, v8 = struct.unpack('<If', raw[i * 8:i * 8 + 8])
+                    recs.append([d8, v8])
+            except Exception as e:
+                log.error("    %s 解析失败: %s", fpath, e)
+                continue
+        # 同日替换
+        if any(r[0] == date_int for r in recs):
+            replaced += 1
+            recs = [r for r in recs if r[0] != date_int]
+        recs.append([date_int, mx])
+        recs.sort(key=lambda r: r[0])
+        try:
+            with open(fpath, 'wb') as f:
+                for d8, v8 in recs:
+                    f.write(struct.pack('<If', int(d8), float(v8)))
+            written += 1
+        except Exception as e:
+            log.error("    %s 写入失败: %s", fpath, e)
+    return written, replaced, skipped
+
+
+def ensure_datacfg_101_name():
+    """把 datacfg.dat 中 ID=101 名称注册为「竞价最大占比」（120B/条, 名字区 offset 8..56）"""
+    if not os.path.exists(DATACFG_FILE):
+        log.warning("datacfg.dat 不存在，跳过101名称注册")
+        return
+    with open(DATACFG_FILE, 'rb') as f:
+        d = bytearray(f.read())
+    found = False
+    name_gbk = SIGNALS_101_NAME.encode('gbk')
+    for i in range(len(d) // 120):
+        off = i * 120
+        if struct.unpack('<I', d[off:off + 4])[0] != SIGNALS_101_ID:
+            continue
+        # 名字区清零后写入（保留 56..60 时间戳 / 60..64 ref 不动）
+        for j in range(off + 8, off + 56):
+            d[j] = 0
+        d[off + 8:off + 8 + len(name_gbk)] = name_gbk
+        found = True
+        break
+    if not found:
+        log.error("datacfg.dat 中未找到 ID=%d，跳过名称注册", SIGNALS_101_ID)
+        return
+    with open(DATACFG_FILE, 'wb') as f:
+        f.write(d)
+    log.info("datacfg.dat: ID=%d 名称已注册为「%s」", SIGNALS_101_ID, SIGNALS_101_NAME)
+
+
 def write_to_file(lines: list) -> bool:
     """追加到 extern_user.txt，替换旧行"""
     if not os.path.exists(EXTERN_FILE):
@@ -234,6 +359,15 @@ def main():
         log.info("   ID=%d (%s): 查到 %d 只, 写入 %d 条",
                  id_val, id_names[id_val], src, written)
     log.info("股票池共 %d 只", len(data))
+
+    # ── ID=101 竞价最大占比 → signals_user_101 序列（日期-数值） ──
+    date_int = resolve_date(sys.argv)
+    log.info("ID=%d「%s」写入 signals_user_101 (date=%d, 取6时点最大值)...",
+             SIGNALS_101_ID, SIGNALS_101_NAME, date_int)
+    w101, r101, s101 = write_signals_101(data, date_int)
+    ensure_datacfg_101_name()
+    log.info("ID=101 竞价最大占比: 写入%d只(替换同日%d只, 跳过无有效值%d只)", w101, r101, s101)
+    log.info("⚠️ 重启通达信后可在 自定义数据101 查看（重启前勿覆盖本文件）")
 
     # 隔夜单占比(ID=115,09:15买二)前5名写入复盘板块(保留已有个股)
     log.info("隔夜单占比(ID=115) TOP5写入复盘板块...")
